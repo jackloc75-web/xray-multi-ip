@@ -1,61 +1,45 @@
-cat << 'EOF' > xray_mgr.sh
+cat << 'EOF' > install.sh
 #!/bin/bash
 
 # --- 1. 变量与路径 ---
 CONFIG_PATH="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
 
-# --- 2. 基础环境自动化安装/修复 ---
-echo "正在检查系统环境..."
+# --- 2. 环境初始化 ---
+if [ -f /usr/bin/yum ]; then
+    yum install -y wget curl python3 iproute-tc iptables
+elif [ -f /usr/bin/apt ]; then
+    apt update && apt install -y wget curl python3 iproute2 iptables
+fi
 
-# 安装 Xray 核心 (如果不存在)
+# 安装 Xray 核心
 if [ ! -f "$XRAY_BIN" ]; then
-    echo "安装 Xray 核心..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 fi
 
-# 创建配置目录
 mkdir -p /usr/local/etc/xray
-
-# 初始化配置文件骨架 (如果文件损坏或为空)
 if [ ! -s "$CONFIG_PATH" ]; then
     echo '{"log":{"loglevel":"error"},"inbounds":[],"outbounds":[],"routing":{"rules":[]}}' > $CONFIG_PATH
 fi
 
-# 修复 systemd 服务 (确保可以 restart)
-if [ ! -f "/etc/systemd/system/xray.service" ]; then
-    cat <<SEC > /etc/systemd/system/xray.service
-[Unit]
-Description=Xray Service
-After=network.target
-[Service]
-ExecStart=$XRAY_BIN run -config $CONFIG_PATH
-Restart=on-failure
-User=root
-[Install]
-WantedBy=multi-user.target
-SEC
-    systemctl daemon-reload
-    systemctl enable xray
-fi
+# 初始化 TC 限速规则 (针对 eth0)
+# 清除旧规则并创建主队列
+tc qdisc del dev eth0 root 2>/dev/null
+tc qdisc add dev eth0 root handle 1: htb default 10
 
 # --- 3. 交互输入 ---
 echo "======================================"
-echo "      Xray 多 IP 端口管理工具"
+echo "    Jackloc75-Web 多 IP 代理+限速版"
 echo "======================================"
-read -p "请输入要【新增】的端口: " PORT
-read -p "请输入该端口的用户名: " USER
-read -p "请输入该端口的密码: " PASS
+read -p "请输入要新增的端口: " PORT
+read -p "请输入用户名: " USER
+read -p "请输入密码: " PASS
+read -p "请输入限速值 (Mbps, 建议 20): " SPEED
+SPEED=${SPEED:-20}
 
-if [[ -z "$PORT" || -z "$USER" || -z "$PASS" ]]; then
-    echo "错误：端口、用户名和密码都不能为空！"
-    exit 1
-fi
-
-# 自动获取当前 eth0 上的所有 IPv4
 IPS=($(hostname -I))
 
-# --- 4. Python 逻辑：安全追加配置 ---
+# --- 4. Python 逻辑：追加配置 ---
 python3 - << PYEOF
 import json
 import sys
@@ -69,75 +53,47 @@ pw = "$PASS"
 try:
     with open(path, 'r') as f:
         data = json.load(f)
-except Exception:
+except:
     data = {"log":{"loglevel":"error"},"inbounds":[],"outbounds":[],"routing":{"rules":[]}}
 
-# 确保 JSON 结构完整
-if 'inbounds' not in data: data['inbounds'] = []
-if 'outbounds' not in data: data['outbounds'] = []
-if 'routing' not in data: data['routing'] = {"rules": []}
-if 'rules' not in data['routing']: data['routing']['rules'] = []
-
-# 检查端口是否冲突
 if any(i.get('port') == port for i in data['inbounds']):
-    print(f"\n❌ 错误: 端口 {port} 已经配置过了，请换一个！")
+    print(f"\n❌ 冲突: 端口 {port} 存在！")
     sys.exit(1)
 
-# 为每个 IP 生成入站和路由
 for i, ip in enumerate(ips):
     tag_id = i + 1
     in_tag = f"in_{port}_{tag_id}"
     out_tag = f"out_{tag_id}"
-    
-    # 1. 增加入站 (带独立账密)
     data['inbounds'].append({
-        "listen": ip,
-        "port": port,
-        "protocol": "socks",
-        "settings": {
-            "auth": "password",
-            "accounts": [{"user": user, "pass": pw}]
-        },
+        "listen": ip, "port": port, "protocol": "socks",
+        "settings": {"auth": "password", "accounts": [{"user": user, "pass": pw}]},
         "tag": in_tag
     })
-    
-    # 2. 增加分流路由规则
     data['routing']['rules'].append({
-        "type": "field",
-        "inboundTag": [in_tag],
-        "outboundTag": out_tag
+        "type": "field", "inboundTag": [in_tag], "outboundTag": out_tag
     })
-    
-    # 3. 确保对应的 IP 出站出口存在
     if not any(o.get('tag') == out_tag for o in data['outbounds']):
-        data['outbounds'].append({
-            "tag": out_tag,
-            "protocol": "freedom",
-            "sendThrough": ip
-        })
+        data['outbounds'].append({"tag": out_tag, "protocol": "freedom", "sendThrough": ip})
 
 with open(path, 'w') as f:
     json.dump(data, f, indent=2)
 PYEOF
 
-# --- 5. 生效配置 ---
+# --- 5. 执行限速命令 (关键步骤) ---
 if [ $? -eq 0 ]; then
-    # 开启非本地 IP 绑定支持
+    # 使用 iptables 标记该端口的流量
+    iptables -t mangle -A OUTPUT -p tcp --sport $PORT -j MARK --set-mark $PORT
+    
+    # 在 TC 中创建对应端口的限速类
+    # 每个端口分配一个独立的 classid
+    tc class add dev eth0 parent 1: classid 1:$PORT htb rate ${SPEED}mbit ceil ${SPEED}mbit
+    tc filter add dev eth0 protocol ip parent 1: prio 1 handle $PORT fw flowid 1:$PORT
+    
+    # 生效并重启
     sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null
-    
-    echo "正在重启服务..."
     systemctl restart xray
-    
     echo "--------------------------------------"
-    echo "✅ 成功！新端口 $PORT 已启用。"
-    echo "目前共有 IP 数量: ${#IPS[@]}"
-    echo "已开启的所有端口: $(grep '"port"' $CONFIG_PATH | awk '{print $2}' | tr -d ',' | sort -u | xargs)"
+    echo "✅ 成功！端口 $PORT 已限速为 ${SPEED}Mbps"
     echo "======================================"
-else
-    echo "配置更新失败，请检查错误提示。"
 fi
 EOF
-
-# 给权限并运行
-chmod +x xray_mgr.sh
-./xray_mgr.sh
