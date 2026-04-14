@@ -1,10 +1,11 @@
 cat << 'EOF' > install.sh
 #!/bin/bash
 
+# 配置路径
 CONFIG_PATH="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
 
-# --- 1. 环境初始化 ---
+# 初始化环境
 if [ ! -f "$XRAY_BIN" ]; then
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 fi
@@ -13,48 +14,35 @@ if [ ! -s "$CONFIG_PATH" ]; then
     echo '{"log":{"loglevel":"error"},"inbounds":[],"outbounds":[],"routing":{"rules":[]}}' > $CONFIG_PATH
 fi
 
-# --- 2. 管理菜单 ---
+# 菜单
 echo "======================================"
-echo "    Jackloc75-Web Xray 端口管理器"
+echo "    Jackloc75-Web Xray 综合管理工具"
 echo "======================================"
-echo "  1. 添加新端口 (带限速)"
-echo "  2. 删除已有端口"
+echo "  1. 添加新端口 (带独立限速)"
+echo "  2. 删除旧端口"
 echo "  3. 退出"
 read -p "请选择 [1-3]: " CHOICE
 
-# --- 3. 删除逻辑 (使用 Python 精准操作) ---
 if [ "$CHOICE" == "2" ]; then
     read -p "请输入要删除的端口号: " DEL_PORT
     python3 - << PYEOF
 import json
 path = '$CONFIG_PATH'
-try:
-    with open(path, 'r') as f:
-        data = json.load(f)
-    # 过滤掉包含该端口的入站和路由规则
-    data['inbounds'] = [i for i in data['inbounds'] if i.get('port') != int("$DEL_PORT")]
-    data['routing']['rules'] = [r for r in data['routing']['rules'] if f"_{DEL_PORT}_" not in r.get('inboundTag', [""])[0]]
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-except Exception as e:
-    print(f"删除失败: {e}")
+with open(path, 'r') as f: data = json.load(f)
+data['inbounds'] = [i for i in data['inbounds'] if i.get('port') != int("$DEL_PORT")]
+data['routing']['rules'] = [r for r in data['routing']['rules'] if f"_{DEL_PORT}_" not in r.get('inboundTag', [""])[0]]
+with open(path, 'w') as f: json.dump(data, f, indent=2)
 PYEOF
-    # 清除 TC 限速规则和 iptables 标记
-    tc filter del dev eth0 protocol ip parent 1: handle $DEL_PORT fw 2>/dev/null
-    tc class del dev eth0 parent 1: classid 1:$DEL_PORT 2>/dev/null
-    iptables -t mangle -D OUTPUT -p tcp --sport $DEL_PORT -j MARK --set-mark $DEL_PORT 2>/dev/null
-    
     systemctl restart xray
-    echo "✅ 端口 $DEL_PORT 已删除并清理限速规则。"
+    echo "✅ 端口 $DEL_PORT 已删除。"
     exit 0
 fi
 
-# --- 4. 添加逻辑 (原有逻辑) ---
 if [ "$CHOICE" == "1" ]; then
-    read -p "请输入要新增的端口: " PORT
-    read -p "请输入用户名: " USER
-    read -p "请输入密码: " PASS
-    read -p "请输入限速值 (Mbps): " SPEED
+    read -p "新增端口: " PORT
+    read -p "用户名: " USER
+    read -p "密码: " PASS
+    read -p "限速 (Mbps): " SPEED
     SPEED=${SPEED:-20}
     IPS=($(hostname -I))
 
@@ -83,12 +71,16 @@ for i, ip in enumerate(ips):
 with open(path, 'w') as f: json.dump(data, f, indent=2)
 PYEOF
 
-    # 开启限速
-    iptables -t mangle -A OUTPUT -p tcp --sport $PORT -j MARK --set-mark $PORT
-    tc class add dev eth0 parent 1: classid 1:$PORT htb rate ${SPEED}mbit ceil ${SPEED}mbit
-    tc filter add dev eth0 protocol ip parent 1: prio 1 handle $PORT fw flowid 1:$PORT
+    # 限速逻辑
+    iptables -t mangle -A OUTPUT -p tcp --sport $PORT -j MARK --set-mark $PORT 2>/dev/null
+    tc qdisc add dev eth0 root handle 1: htb default 10 2>/dev/null
+    tc class add dev eth0 parent 1: classid 1:$PORT htb rate ${SPEED}mbit ceil ${SPEED}mbit 2>/dev/null
+    tc filter add dev eth0 protocol ip parent 1: prio 1 handle $PORT fw flowid 1:$PORT 2>/dev/null
     
     systemctl restart xray
-    echo "✅ 成功添加端口 $PORT 并限速 ${SPEED}Mbps"
+    echo "✅ 成功！端口 $PORT 已限速 ${SPEED}Mbps"
 fi
 EOF
+
+chmod +x install.sh
+./install.sh
