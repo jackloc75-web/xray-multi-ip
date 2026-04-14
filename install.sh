@@ -1,64 +1,72 @@
 cat << 'EOF' > install.sh
 #!/bin/bash
 
-# --- 1. 变量与路径 ---
 CONFIG_PATH="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
 
-# --- 2. 环境初始化 ---
-if [ -f /usr/bin/yum ]; then
-    yum install -y wget curl python3 iproute-tc iptables
-elif [ -f /usr/bin/apt ]; then
-    apt update && apt install -y wget curl python3 iproute2 iptables
-fi
-
-# 安装 Xray 核心
+# --- 1. 环境初始化 ---
 if [ ! -f "$XRAY_BIN" ]; then
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 fi
-
 mkdir -p /usr/local/etc/xray
 if [ ! -s "$CONFIG_PATH" ]; then
     echo '{"log":{"loglevel":"error"},"inbounds":[],"outbounds":[],"routing":{"rules":[]}}' > $CONFIG_PATH
 fi
 
-# 初始化 TC 限速规则 (针对 eth0)
-# 清除旧规则并创建主队列
-tc qdisc del dev eth0 root 2>/dev/null
-tc qdisc add dev eth0 root handle 1: htb default 10
-
-# --- 3. 交互输入 ---
+# --- 2. 管理菜单 ---
 echo "======================================"
-echo "    Jackloc75-Web 多 IP 代理+限速版"
+echo "    Jackloc75-Web Xray 端口管理器"
 echo "======================================"
-read -p "请输入要新增的端口: " PORT
-read -p "请输入用户名: " USER
-read -p "请输入密码: " PASS
-read -p "请输入限速值 (Mbps, 建议 20): " SPEED
-SPEED=${SPEED:-20}
+echo "  1. 添加新端口 (带限速)"
+echo "  2. 删除已有端口"
+echo "  3. 退出"
+read -p "请选择 [1-3]: " CHOICE
 
-IPS=($(hostname -I))
-
-# --- 4. Python 逻辑：追加配置 ---
-python3 - << PYEOF
+# --- 3. 删除逻辑 (使用 Python 精准操作) ---
+if [ "$CHOICE" == "2" ]; then
+    read -p "请输入要删除的端口号: " DEL_PORT
+    python3 - << PYEOF
 import json
-import sys
-
 path = '$CONFIG_PATH'
-ips = "${IPS[@]}".split()
-port = int("$PORT")
-user = "$USER"
-pw = "$PASS"
-
 try:
     with open(path, 'r') as f:
         data = json.load(f)
+    # 过滤掉包含该端口的入站和路由规则
+    data['inbounds'] = [i for i in data['inbounds'] if i.get('port') != int("$DEL_PORT")]
+    data['routing']['rules'] = [r for r in data['routing']['rules'] if f"_{DEL_PORT}_" not in r.get('inboundTag', [""])[0]]
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+except Exception as e:
+    print(f"删除失败: {e}")
+PYEOF
+    # 清除 TC 限速规则和 iptables 标记
+    tc filter del dev eth0 protocol ip parent 1: handle $DEL_PORT fw 2>/dev/null
+    tc class del dev eth0 parent 1: classid 1:$DEL_PORT 2>/dev/null
+    iptables -t mangle -D OUTPUT -p tcp --sport $DEL_PORT -j MARK --set-mark $DEL_PORT 2>/dev/null
+    
+    systemctl restart xray
+    echo "✅ 端口 $DEL_PORT 已删除并清理限速规则。"
+    exit 0
+fi
+
+# --- 4. 添加逻辑 (原有逻辑) ---
+if [ "$CHOICE" == "1" ]; then
+    read -p "请输入要新增的端口: " PORT
+    read -p "请输入用户名: " USER
+    read -p "请输入密码: " PASS
+    read -p "请输入限速值 (Mbps): " SPEED
+    SPEED=${SPEED:-20}
+    IPS=($(hostname -I))
+
+    python3 - << PYEOF
+import json
+path = '$CONFIG_PATH'
+ips = "${IPS[@]}".split()
+port = int("$PORT")
+try:
+    with open(path, 'r') as f: data = json.load(f)
 except:
     data = {"log":{"loglevel":"error"},"inbounds":[],"outbounds":[],"routing":{"rules":[]}}
-
-if any(i.get('port') == port for i in data['inbounds']):
-    print(f"\n❌ 冲突: 端口 {port} 存在！")
-    sys.exit(1)
 
 for i, ip in enumerate(ips):
     tag_id = i + 1
@@ -66,34 +74,21 @@ for i, ip in enumerate(ips):
     out_tag = f"out_{tag_id}"
     data['inbounds'].append({
         "listen": ip, "port": port, "protocol": "socks",
-        "settings": {"auth": "password", "accounts": [{"user": user, "pass": pw}]},
+        "settings": {"auth": "password", "accounts": [{"user": "$USER", "pass": "$PASS"}]},
         "tag": in_tag
     })
-    data['routing']['rules'].append({
-        "type": "field", "inboundTag": [in_tag], "outboundTag": out_tag
-    })
+    data['routing']['rules'].append({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag})
     if not any(o.get('tag') == out_tag for o in data['outbounds']):
         data['outbounds'].append({"tag": out_tag, "protocol": "freedom", "sendThrough": ip})
-
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
+with open(path, 'w') as f: json.dump(data, f, indent=2)
 PYEOF
 
-# --- 5. 执行限速命令 (关键步骤) ---
-if [ $? -eq 0 ]; then
-    # 使用 iptables 标记该端口的流量
+    # 开启限速
     iptables -t mangle -A OUTPUT -p tcp --sport $PORT -j MARK --set-mark $PORT
-    
-    # 在 TC 中创建对应端口的限速类
-    # 每个端口分配一个独立的 classid
     tc class add dev eth0 parent 1: classid 1:$PORT htb rate ${SPEED}mbit ceil ${SPEED}mbit
     tc filter add dev eth0 protocol ip parent 1: prio 1 handle $PORT fw flowid 1:$PORT
     
-    # 生效并重启
-    sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null
     systemctl restart xray
-    echo "--------------------------------------"
-    echo "✅ 成功！端口 $PORT 已限速为 ${SPEED}Mbps"
-    echo "======================================"
+    echo "✅ 成功添加端口 $PORT 并限速 ${SPEED}Mbps"
 fi
 EOF
